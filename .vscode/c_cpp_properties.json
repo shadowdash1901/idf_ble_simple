@@ -1,0 +1,17 @@
+{
+    "configurations": [
+        {
+            "name": "PC",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/build/esp-idf",
+                "${env:IDF_PATH}/components/**"
+            ],
+            "intelliSenseMode": "windows-msvc-x64",
+            "compilerPath": "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.42.34433\\bin\\Hostx64\\x64\\cl.exe",
+            "cStandard": "c17",
+            "cppStandard": "c++17"
+        }
+    ],
+    "version": 4
+}
