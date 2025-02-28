@@ -11,25 +11,51 @@
 #include "FreeRTOS/FreeRTOS.h"
 #include "FreeRTOS/semphr.h"
 
-struct gatts_simple_service_data {
-    SemaphoreHandle_t mutex;
-    esp_gatt_srvc_id_t service_id;
-    struct gatts_simple_service_data* next_service_data;
-};
+#define GATTS_SIMPLE_MUTEX_TIMEOUT 200
+
+#define ESP_UUID128_STR "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x"
+#define ESP_UUID128_HEX(uuid)   uuid[15], uuid[14], uuid[13], uuid[12], \
+                                uuid[11], uuid[10], uuid[9],  uuid[8],  uuid[7], uuid[6], \
+                                uuid[5],  uuid[4],  uuid[3],  uuid[2],  uuid[1], uuid[0] 
 
 struct gatts_simple_app_data {
     uint16_t app_id;
     esp_gatt_if_t gatt_if;
-    struct gatts_simple_service_data* service_list_root;
     char* device_name;
-    SemaphoreHandle_t mutex;
     struct gatts_simple_app_data* next_app_data;
+};
+
+struct gatts_simple_service_data {
+    esp_gatt_srvc_id_t service_id;
+    uint16_t service_handle;
+    uint16_t parent_app_id;
+    bool create_pending;
+    struct gatts_simple_service_data* next_service_data;
+};
+
+struct gatts_simple_char_data {
+    uint16_t parent_service_id;
+    uint16_t char_handle;
+    esp_bt_uuid_t uuid;
+    esp_gatt_perm_t permissions;
+    esp_gatt_char_prop_t properties;
+    esp_attr_value_t* value;
+    esp_attr_control_t* control;
+    bool create_pending;
+    struct gatts_simple_char_data* next_char_data;
 };
 
 const char* gatts_tag = "gatts_simple";
 struct gatts_simple_app_data app_list_root = {
     .next_app_data = NULL,
 };
+struct gatts_simple_service_data service_list_root = {
+    .next_service_data = NULL,
+};
+struct gatts_simple_char_data char_list_root = {
+    .next_char_data = NULL,
+};
+SemaphoreHandle_t gatts_simple_mutex;
 
 void uuid_from_str(uint8_t* uuid_dest, const char* uuid_str) {
     uint8_t uuid_buf[16];
@@ -53,88 +79,184 @@ void uuid_from_str(uint8_t* uuid_dest, const char* uuid_str) {
     memcpy(uuid_dest, uuid_buf, 16);
 }
 
-// creates a simple bluetooth app, with no characteristics, and advertising data
-// stores a pointer in hdl to be used in future calls to this library for this app
-// app_id must be unique from any previously created apps
-esp_err_t gatts_simple_create_app(gatts_simple_app_handle_t* hdl, gatts_simple_app_def_t* app_def) {
-    esp_err_t ret = ESP_OK;
-    if (hdl == NULL) {
-        return ESP_ERR_INVALID_ARG;
+esp_err_t add_app_data(struct gatts_simple_app_data** hdl, uint16_t app_id, char* device_name) {
+    struct gatts_simple_app_data* app_data = &app_list_root;
+    while (app_data->next_app_data != NULL) {
+        if (app_data->next_app_data->app_id == app_id) {
+            ESP_LOGE(gatts_tag, "add_app_data: list already contains app_id:%d", app_id);
+            return ESP_ERR_INVALID_ARG;
+        }
+        app_data = app_data->next_app_data;
     }
     *hdl = malloc(sizeof(struct gatts_simple_app_data));
     if (*hdl == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    (*hdl)->mutex = xSemaphoreCreateMutex();
-    (*hdl)->app_id = app_def->app_id;
+    app_data->next_app_data = *hdl;
+    (*hdl)->app_id = app_id;
     (*hdl)->next_app_data = NULL;
-    (*hdl)->service_list_root = NULL;
-    uint8_t name_len = strlen(app_def->device_name);
-    (*hdl)->device_name = malloc(name_len + 1);
+    uint16_t name_len = strlen(device_name) + 1;
+    (*hdl)->device_name = malloc(name_len);
     if ((*hdl)->device_name == NULL) {
-        ret = ESP_ERR_NO_MEM;
-        goto err;
+        free(*hdl);
+        (*hdl) = NULL;
+        return ESP_ERR_NO_MEM;
     }
-    memcpy((*hdl)->device_name, app_def->device_name, name_len + 1);
-    struct gatts_simple_app_data* cur_item = &app_list_root;
-    while (cur_item->next_app_data != NULL) {
-        cur_item = cur_item->next_app_data;
+    memcpy((*hdl)->device_name, device_name, name_len);
+    return ESP_OK;
+}
+
+esp_err_t remove_app_data(uint16_t app_id) {
+    struct gatts_simple_app_data* cur_data = app_list_root.next_app_data;
+    while (cur_data->next_app_data != NULL) {
+        if (cur_data->next_app_data->app_id == app_id) {
+            struct gatts_simple_app_data* del = cur_data->next_app_data;
+            cur_data->next_app_data->next_app_data = del->next_app_data;
+            free(del->device_name);
+            free(del);
+        }
     }
-    cur_item->next_app_data = *hdl;
+    return ESP_OK;
+}
+
+esp_err_t get_app_data(struct gatts_simple_app_data** app_data, uint16_t app_id) {
+    struct gatts_simple_app_data* cur_data = app_list_root.next_app_data;
+    while (cur_data != NULL && cur_data->app_id != app_id) {
+        cur_data = cur_data->next_app_data;
+    }
+    *app_data = cur_data;
+    return (cur_data == NULL) ? ESP_FAIL : ESP_OK;
+}
+
+// creates a simple bluetooth app, with no characteristics, and advertising data
+// stores a pointer in hdl to be used in future calls to this library for this app
+// app_id must be unique from any previously created apps
+esp_err_t gatts_simple_create_app(gatts_simple_app_handle_t* hdl, gatts_simple_app_def_t* app_def) {
+    if (hdl == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!xSemaphoreTake(gatts_simple_mutex, GATTS_SIMPLE_MUTEX_TIMEOUT)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    add_app_data(hdl, app_def->app_id, app_def->device_name);
     return esp_ble_gatts_app_register((*hdl)->app_id);
-    
-    err:
-    if ((*hdl)->device_name != NULL) {
-        free((*hdl)->device_name);
+}
+
+esp_err_t add_service_data(struct gatts_simple_service_data** data, uint16_t app_id, esp_bt_uuid_t* uuid) {
+    if (data == NULL) {
+        return ESP_ERR_INVALID_ARG;
     }
+    *data = malloc(sizeof(struct gatts_simple_service_data));
+    if (*data == NULL) {
+        ESP_LOGE(gatts_tag, "Failed to allocate data for new service");
+        return ESP_ERR_NO_MEM;
+    }
+    (*data)->service_id.id.uuid = *uuid;
+    (*data)->next_service_data = NULL;
+    (*data)->parent_app_id = app_id;
+    struct gatts_simple_service_data* cur_data = &service_list_root;
+    while (cur_data->next_service_data != NULL) {
+        cur_data = cur_data->next_service_data;
+    }
+    cur_data->next_service_data = *data;
+    return ESP_OK;
+}
+
+esp_err_t remove_service_data(uint16_t app_id, struct gatts_simple_service_data* del_data) {
+    struct gatts_simple_service_data* service_data = &service_list_root;
+    while (service_data->next_service_data != NULL) {
+        if (service_data->next_service_data == del_data) {
+            del_data = service_data->next_service_data;
+            service_data->next_service_data = del_data->next_service_data;
+            free(del_data);
+            break;
+        }
+    }
+    return ESP_OK;
+}
+
+esp_err_t gatts_simple_add_service(gatts_simple_service_handle_t* hdl_srv, gatts_simple_app_handle_t hdl_app, 
+        const char* uuid_str) {
+    esp_err_t ret = ESP_OK;
+    if (xSemaphoreTake(gatts_simple_mutex, GATTS_SIMPLE_MUTEX_TIMEOUT) != pdTRUE) {
+        ESP_LOGE(gatts_tag, "gatts_simple_add_service: failed to get mutex");
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_bt_uuid_t uuid = {
+        .len = ESP_UUID_LEN_128,
+    };
+    uuid_from_str(uuid.uuid.uuid128, uuid_str);
+    ESP_LOGI(gatts_tag, "Service UUID "ESP_UUID128_STR, ESP_UUID128_HEX(uuid.uuid.uuid128));
+    ESP_RETURN_ON_ERROR(add_service_data(hdl_srv, hdl_app->app_id, &uuid), gatts_tag, "Failed to create service data");
+    (*hdl_srv)->create_pending = true;
+    ret = esp_ble_gatts_create_service(hdl_app->gatt_if, &(*hdl_srv)->service_id, 1);
     return ret;
 }
 
-esp_err_t gatts_simple_add_service(gatts_simple_app_handle_t hdl_app, gatts_simple_service_handle_t* hdl_srv, 
-        esp_bt_uuid_t* uuid) {
-    esp_err_t ret = ESP_OK;
-    (*hdl_srv) = malloc(sizeof(struct gatts_simple_service_data));
-    if ((*hdl_srv) == NULL) {
+esp_err_t add_char_data(struct gatts_simple_char_data** char_hdl, uint16_t parent_service_id, 
+        esp_bt_uuid_t* uuid, esp_gatt_perm_t permissions, esp_gatt_char_prop_t properties, 
+        esp_attr_value_t* value, esp_attr_control_t* control) {
+    struct gatts_simple_char_data* char_data = &char_list_root;
+    while (char_data->next_char_data != NULL) {
+        char_data = char_data->next_char_data;
+    }
+    char_data->next_char_data = malloc(sizeof(struct gatts_simple_char_data));
+    if (char_data->next_char_data == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    (*hdl_srv)->mutex = xSemaphoreCreateMutex();
-    (*hdl_srv)->service_id.id.uuid = *uuid;
-    ESP_LOG_BUFFER_HEX("uuid: ", (*hdl_srv)->service_id.id.uuid.uuid.uuid128, 16);
-    if(xSemaphoreTake(hdl_app->mutex, 100 / portTICK_PERIOD_MS) == pdTRUE) {
-        if(xSemaphoreTake((*hdl_srv)->mutex, 100 / portTICK_PERIOD_MS) == pdTRUE) {
-            ret = esp_ble_gatts_create_service(hdl_app->gatt_if, &(*hdl_srv)->service_id, 1);
-            xSemaphoreGive((*hdl_srv)->mutex);
-            xSemaphoreGive(hdl_app->mutex);
-        } else {
-            ret = ESP_FAIL;
-            xSemaphoreGive(hdl_app->mutex);
-            ESP_LOGE(gatts_tag, "add service: failed to get service mutex.  This should never happen");
-        }
-    } else {
-        ESP_LOGI(gatts_tag, "add service: failed to get app mutex.  Maybe busy and will be done later...");
+    char_data = char_data->next_char_data;
+    char_data->uuid = *uuid;
+    char_data->permissions = permissions;
+    char_data->properties = properties;
+    char_data->value = value;
+    char_data->control = control;
+    *char_hdl = char_data;
+    return ESP_OK;
+}
+
+esp_err_t gatts_simple_add_char(gatts_simple_char_handle_t* char_hdl, gatts_simple_service_handle_t serv_hdl,
+        const char* uuid_str, esp_gatt_perm_t perm, esp_gatt_char_prop_t prop, esp_attr_value_t* value, 
+        esp_attr_control_t* control) {
+    esp_err_t ret = ESP_OK;
+    if (char_hdl == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    esp_bt_uuid_t uuid = {
+        .len = ESP_UUID_LEN_128,
+    };
+    uuid_from_str(uuid.uuid.uuid128, uuid_str);
+    ESP_LOGI(gatts_tag, "Char uuid: "ESP_UUID128_STR, ESP_UUID128_HEX(uuid.uuid.uuid128));
+    if (xSemaphoreTake(gatts_simple_mutex, GATTS_SIMPLE_MUTEX_TIMEOUT) != pdTRUE) {
+        ESP_LOGE(gatts_tag, "gatts_simple_add_char: failed to get mutex");
+        return ESP_ERR_TIMEOUT;
+    }
+    ESP_RETURN_ON_ERROR(add_char_data(char_hdl, serv_hdl->service_handle, &uuid, perm, prop, value, control),
+        gatts_tag, "gatts_simple_char: failed to add char");
+    ESP_LOGI(gatts_tag, "Adding characteristic srv_hdl:%d perm:%d prop:%d", serv_hdl->service_handle, perm, prop);
+    ret = esp_ble_gatts_add_char(serv_hdl->service_handle, &uuid, perm, prop, value, control);
+    if (ret != ESP_OK) {
+        xSemaphoreGive(gatts_simple_mutex);
     }
     return ret;
 }
 
 static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t* param) {
     switch (event) {
-    case ESP_GATTS_REG_EVT:
+    case ESP_GATTS_REG_EVT: {
         ESP_LOGI(gatts_tag, "GATT server register, status %d, app_id %d, gatts_if %d", param->reg.status, param->reg.app_id, gatts_if);
-        struct gatts_simple_app_data* cur_app = app_list_root.next_app_data;
-        while (cur_app != NULL && cur_app->app_id != param->reg.app_id) {
-            cur_app = cur_app->next_app_data;
-        }
-        if (cur_app == NULL) {
+        struct gatts_simple_app_data* app_data;
+        if (get_app_data(&app_data, param->reg.app_id) != ESP_OK) {
             ESP_LOGE(gatts_tag, "GATT server register: do not recognize");
-            break;
         }
         if (param->reg.status != ESP_GATT_OK) {
+            remove_app_data(param->reg.app_id);
             ESP_LOGE(gatts_tag, "GATT server register: bad status");
             break;
         }
-        cur_app->gatt_if = gatts_if;
-        xSemaphoreGive(cur_app->mutex);
+        app_data->gatt_if = gatts_if;
+        xSemaphoreGive(gatts_simple_mutex);
         break;
+    }
     case ESP_GATTS_READ_EVT:
         ESP_LOGI(gatts_tag, "Characteristic read, conn_id %d, trans_id %" PRIu32 ", handle %d, offset:%d",
                 param->read.conn_id, param->read.trans_id, param->read.handle, param->read.offset);
@@ -145,9 +267,23 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
     case ESP_GATTS_UNREG_EVT:
         ESP_LOGI(gatts_tag, "Unregister");
         break;
-    case ESP_GATTS_CREATE_EVT:
+    case ESP_GATTS_CREATE_EVT: {
         ESP_LOGI(gatts_tag, "Service create, status %d, service_handle %d", param->create.status, param->create.service_handle);
+        struct gatts_simple_service_data* service_data = service_list_root.next_service_data;
+        while (service_data != NULL && !service_data->create_pending) {
+            service_data = service_data->next_service_data;
+        }
+        if (service_data != NULL) {
+            service_data->service_id = param->create.service_id;
+            service_data->service_handle = param->create.service_handle;
+            service_data->create_pending = false;
+            //esp_ble_gatts_start_service(service_data->service_handle);
+            xSemaphoreGive(gatts_simple_mutex);
+        } else {
+            ESP_LOGE(gatts_tag, "gatts_event_handler: service create: service not recognized");
+        }
         break;
+    }
     case ESP_GATTS_ADD_INCL_SRVC_EVT:
         ESP_LOGI(gatts_tag, "Added included service, status %d, attr_handle %d, service_handle %d",
             param->add_incl_srvc.status, param->add_incl_srvc.attr_handle, param->add_incl_srvc.service_handle);
@@ -155,6 +291,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
     case ESP_GATTS_ADD_CHAR_EVT:
         ESP_LOGI(gatts_tag, "Characteristic add, status %d, attr_handle %d service_handle %d",
             param->add_char.status, param->add_char.attr_handle, param->add_char.service_handle);
+        xSemaphoreGive(gatts_simple_mutex);
         break;
     case ESP_GATTS_ADD_CHAR_DESCR_EVT:
         ESP_LOGI(gatts_tag, "Descriptor add, status %d, attr_handle %d, service_handle %d",
@@ -166,6 +303,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
     case ESP_GATTS_START_EVT:
         ESP_LOGI(gatts_tag, "service start, status %d, service_handle %d",
             param->start.status, param->start.service_handle);
+        xSemaphoreGive(gatts_simple_mutex);
         break;
     case ESP_GATTS_STOP_EVT:
         ESP_LOGI(gatts_tag, "service stop, status %d, service_handle %d",
@@ -203,40 +341,20 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
     switch (event) {
     case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
-        ESP_LOGI(gatts_tag, "Raw Adv Data Complete");
-        /*
-        adv_config_done &= (~adv_config_flag);
-        if (adv_config_done==0){
-            esp_ble_gap_start_advertising(&adv_params);
-        }
-            */
+        ESP_LOGI(gatts_tag, "Raw adv Data Complete");
+        xSemaphoreGive(gatts_simple_mutex);
         break;
     case ESP_GAP_BLE_SCAN_RSP_DATA_RAW_SET_COMPLETE_EVT:
-        ESP_LOGI(gatts_tag, "RAW adv rsp data complete");
-        /*
-        adv_config_done &= (~scan_rsp_config_flag);
-        if (adv_config_done==0){
-            esp_ble_gap_start_advertising(&adv_params);
-        }
-            */
+        ESP_LOGI(gatts_tag, "Raw rsp data complete");
+        xSemaphoreGive(gatts_simple_mutex);
         break;
     case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
         ESP_LOGI(gatts_tag, "Adv data set compete");
-        /*
-        adv_config_done &= (~adv_config_flag);
-        if (adv_config_done == 0){
-            esp_ble_gap_start_advertising(&adv_params);
-        }
-            */
+        xSemaphoreGive(gatts_simple_mutex);
         break;
     case ESP_GAP_BLE_SCAN_RSP_DATA_SET_COMPLETE_EVT:
         ESP_LOGI(gatts_tag, "Scan resp data set complete");
-        /*
-        adv_config_done &= (~scan_rsp_config_flag);
-        if (adv_config_done == 0){
-            esp_ble_gap_start_advertising(&adv_params);
-        }
-            */
+        xSemaphoreGive(gatts_simple_mutex);
         break;
     case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
         //advertising start complete event to indicate advertising start successfully or failed
@@ -245,6 +363,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
             break;
         }
         ESP_LOGI(gatts_tag, "Advertising start successfully");
+        xSemaphoreGive(gatts_simple_mutex);
         break;
     case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
         if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
@@ -277,9 +396,55 @@ esp_err_t gatts_simple_init() {
     ESP_RETURN_ON_ERROR(esp_bt_controller_enable(ESP_BT_MODE_BLE), gatts_tag, "failed to enable bt controller");
     ESP_RETURN_ON_ERROR(esp_bluedroid_init(), gatts_tag, "esp_bluedroid_init() failed");
     ESP_RETURN_ON_ERROR(esp_bluedroid_enable(), gatts_tag, "esp_bluedroid_enable() failed");
+    ESP_RETURN_ON_ERROR(esp_ble_gatt_set_local_mtu(500), gatts_tag, "failed to set local mtu");
     ESP_RETURN_ON_ERROR(esp_ble_gatts_register_callback(gatts_event_handler), 
         gatts_tag, "esp_ble_gatts_register_callback() failed");
     ESP_RETURN_ON_ERROR(esp_ble_gap_register_callback(gap_event_handler), 
-        gatts_tag, "exp_ble_gap_register_callback() failed");
+        gatts_tag, "esp_ble_gap_register_callback() failed");
+    gatts_simple_mutex = xSemaphoreCreateBinary();
+    xSemaphoreGive(gatts_simple_mutex);
+    return ESP_OK;
+}
+
+esp_err_t gatts_simple_advertise_raw(esp_ble_adv_params_t* adv_params, 
+        uint8_t* adv_data, uint16_t adv_data_size, 
+        uint8_t* rsp_data, uint16_t rsp_data_size) {
+    if (xSemaphoreTake(gatts_simple_mutex, GATTS_SIMPLE_MUTEX_TIMEOUT) != pdTRUE) {
+        ESP_LOGE(gatts_tag, "gatts_simple_advertise_raw: failed to take mutex to configure adv raw");
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_ble_gap_config_adv_data_raw(adv_data, adv_data_size);
+    if (xSemaphoreTake(gatts_simple_mutex, GATTS_SIMPLE_MUTEX_TIMEOUT) != pdTRUE) {
+        ESP_LOGE(gatts_tag, "gatts_simple_advertise_raw: failed to take mutex to configure rsp raw");
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_ble_gap_config_scan_rsp_data_raw(rsp_data, rsp_data_size);
+    if (xSemaphoreTake(gatts_simple_mutex, GATTS_SIMPLE_MUTEX_TIMEOUT) != pdTRUE) {
+        ESP_LOGE(gatts_tag, "gatts_simple_advertise_raw: failed to take mutex to configure rsp raw");
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_ble_gap_start_advertising(adv_params);
+    return ESP_OK;
+}
+
+esp_err_t gatts_simple_advertise(esp_ble_adv_params_t* adv_params, 
+        esp_ble_adv_data_t* adv_data, esp_ble_adv_data_t* rsp_data, const char* dev_name) {
+    if (xSemaphoreTake(gatts_simple_mutex, GATTS_SIMPLE_MUTEX_TIMEOUT) != pdTRUE) {
+        ESP_LOGE(gatts_tag, "gatts_simple_advertise: failed to take mutex to configure adv data");
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_ble_gap_set_device_name(dev_name);
+    esp_ble_gap_config_adv_data(adv_data);
+    if (xSemaphoreTake(gatts_simple_mutex, GATTS_SIMPLE_MUTEX_TIMEOUT) != pdTRUE) {
+        ESP_LOGE(gatts_tag, "gatts_simple_advertise: failed to take mutex to advertise rsp data");
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_ble_gap_config_adv_data(rsp_data);
+    if (xSemaphoreTake(gatts_simple_mutex, GATTS_SIMPLE_MUTEX_TIMEOUT) != pdTRUE) {
+        ESP_LOGE(gatts_tag, "gatts_simple_advertise: failed to take mutex to advertise rsp data");
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_ble_gap_start_advertising(adv_params);
+
     return ESP_OK;
 }
